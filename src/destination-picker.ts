@@ -13,10 +13,50 @@ export function destinationPayload(value: DestinationValue): { root?: "dsh" | "a
   return { root: value.location === "agents" ? "agents" : "dsh" };
 }
 
-/** 能否提交：工作区必须是列表里可用的一项；传入用户位置时，所选位置也必须可用。 */
+/** 一行折叠列表里可能合并了多个登记路径，选项要按“每一个登记路径”出，才能对上侧栏里的工作区名。 */
+function registeredPaths(row: WorkspaceRow): string[] {
+  return (row.registeredPaths.length ? row.registeredPaths : [row.path]).filter(Boolean);
+}
+
+/** 路径末段：把登记路径显示成侧栏里那样的工作区名。 */
+function lastSegment(path: string): string {
+  const trimmed = path.replace(/[\\/]+$/, "");
+  const at = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+  return (at >= 0 ? trimmed.slice(at + 1) : trimmed) || path;
+}
+
+/** 能否提交：工作区必须是列表里可用的一项（任一登记路径都算）；传入用户位置时，所选位置也必须可用。 */
 export function destinationReady(value: DestinationValue, workspaces: readonly WorkspaceRow[], userDestinations?: readonly { key: string; available?: boolean }[]): boolean {
   if (value.scope === "user") return !userDestinations || userDestinations.some((item) => item.key === value.location && item.available === true);
-  return workspaces.some((row) => row.available && !!row.registeredPaths[0] && row.registeredPaths[0] === value.workspace);
+  return workspaces.some((row) => row.available && registeredPaths(row).some((path) => path === value.workspace));
+}
+
+/**
+ * 下拉选项：每个已登记工作区路径一条，而不是每个项目根只取第一条。
+ *
+ * 为什么必须逐条列出：多个工作区子目录常解析到同一个项目根（例如都在同一个 git 仓库下），
+ * 合并成一行后下拉里只剩项目根名字，用户在侧栏看到的工作区名一个也找不到，就会以为
+ * 「只能选极少一部分工作区」。逐条列出后，每个工作区名都能直接选中；它们最终写入的是
+ * 同一个 `<项目根>/.dsh/skills`，下方路径预览会如实显示，不会让用户误以为写到了别处。
+ */
+export function workspaceChoices(workspaces: readonly WorkspaceRow[], t: Translate): { value: string; label: string; disabled: boolean }[] {
+  // 单一路径的行沿用行名（与服务端按项目根起的名字一致）；合并了多个工作区的行只能按各自目录名区分。
+  const flat = workspaces.flatMap((row) => {
+    const paths = registeredPaths(row);
+    return paths.map((path) => ({ row, path, name: (paths.length === 1 ? row.name : lastSegment(path)) || lastSegment(path) }));
+  });
+  const nameCount = new Map<string, number>();
+  for (const { name } of flat) nameCount.set(name.toLowerCase(), (nameCount.get(name.toLowerCase()) ?? 0) + 1);
+  return flat
+    .map(({ row, path, name }) => {
+      // 只显示工作区名；只有重名（不同目录同名）时才附完整路径，否则分不清选的是哪一个。
+      const label = !row.available
+        ? t("dest.workspace.unavailable", { name })
+        : (nameCount.get(name.toLowerCase()) ?? 0) > 1 ? name + " · " + path : name;
+      return { value: path, label, disabled: !row.available };
+    })
+    // 长列表按名称排序，几十个工作区里也找得到。
+    .sort((a, b) => a.label.localeCompare(b.label) || a.value.localeCompare(b.value));
 }
 
 /** 工作区项目 DSH 目录的预览，仅用于展示；实际写入路径由服务端重新解析。 */
@@ -60,6 +100,9 @@ export const destinationCss = [
   ".dssm-destination-pair .dssm-menu-select-trigger{display:flex!important;width:100%!important;min-width:0!important;height:36px!important;border-radius:var(--dsw-radius-md,10px)!important;padding:0 12px!important;box-sizing:border-box!important}",
   "@media (max-width:420px){.dssm-destination-pair{grid-template-columns:minmax(0,1fr)}}",
   ".dssm-destination-path{display:block;box-sizing:border-box;width:100%;padding:8px 10px;border:0.5px solid var(--dsw-alias-border-l2,rgba(127,127,127,.2));border-radius:var(--dsw-radius-lg,16px);background:var(--dsw-alias-bg-layer-1,rgba(127,127,127,.06));overflow-wrap:anywhere;font-size:12px;line-height:18px}",
+  // 工作区多时下拉会很长：限高并在菜单里滚动，保证每一项都能滚到（宿主 Menu 自带视口上限，
+  // 这里收紧到更适合表单的大小；overscroll-behavior 防止滚到底后把弹窗一起带走）。
+  ".dssm-source-select-menu{max-height:min(360px,calc(100vh - 96px));overflow-y:auto;overscroll-behavior:contain}",
   ".dssm-destination-unavailable{display:flex;flex-direction:column;gap:2px}",
 ].join("");
 
@@ -74,21 +117,12 @@ export function createDestinationPicker({ react, SourceSelect, translateError }:
   const h = react.createElement;
   return function DestinationPicker({ t, value, onChange, workspaces, userDestinations, allowAgents, disabled }: DestinationPickerProps) {
     const inWorkspace = value.scope === "workspace";
-    const chosen = workspaces.find((row) => !!row.registeredPaths[0] && row.registeredPaths[0] === value.workspace);
+    const chosen = workspaces.find((row) => registeredPaths(row).some((path) => path === value.workspace));
     const scopeOptions = [
       { value: "user", label: t("dest.scope.user") },
       { value: "workspace", label: t("dest.scope.workspace") },
     ];
-    // 下拉只显示名称；只有重名时才附上路径，否则用户分不清选的是哪一个。
-    const nameCount = new Map<string, number>();
-    for (const row of workspaces) nameCount.set(row.name, (nameCount.get(row.name) ?? 0) + 1);
-    const workspaceOptions = [{ value: "", label: t("dest.workspace.placeholder") }].concat(
-      workspaces.map((row) => ({
-        value: row.registeredPaths[0] || "",
-        label: !row.available ? t("dest.workspace.unavailable", { name: row.name }) : (nameCount.get(row.name) ?? 0) > 1 ? row.name + " · " + row.path : row.name,
-        disabled: !row.available || !row.registeredPaths[0],
-      })),
-    );
+    const workspaceOptions = [{ value: "", label: t("dest.workspace.placeholder") }].concat(workspaceChoices(workspaces, t));
     // 用户目录下只展示后端确实返回的位置，避免出现用不了的选项；工作区的位置固定为项目 DSH，不是选项。
     const offered = (allowAgents ? ["dsh", "agents"] : ["dsh"]) as ("dsh" | "agents")[];
     const locations = offered.filter((key) => userDestinations.some((item) => item.key === key));

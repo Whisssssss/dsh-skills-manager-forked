@@ -1,6 +1,6 @@
 // 目标选择器：用户目录默认、工作区必须点选、位置随范围联动，三个入口共用。
 import assert from "node:assert/strict";
-import { createDestinationPicker, destinationCss, destinationLocales, destinationPayload, destinationReady } from "../src/destination-picker.ts";
+import { createDestinationPicker, destinationCss, destinationLocales, destinationPayload, destinationReady, workspaceChoices } from "../src/destination-picker.ts";
 
 let values = [], cursor = 0;
 const react = {
@@ -42,6 +42,13 @@ assert.match(pathRule, /padding:8px 10px/, "路径框保留内边距");
 assert.match(pathRule, /border:0\.5px solid/, "路径框采用官方发丝线边框");
 assert.match(pathRule, /border-radius:var\(--dsw-radius-lg,16px\)/, "路径框采用官方嵌套内容圆角");
 assert.match(pathRule, /background:var\(--dsw-alias-bg-layer-1/, "路径框使用宿主背景令牌");
+// 工作区多时下拉必须限高并可滚动，否则超出一屏的项根本到不了。
+const menuRuleStart = destinationCss.indexOf(".dssm-source-select-menu{max-height");
+assert.ok(menuRuleStart > 0, "必须为下拉列表单独声明限高规则");
+const menuRule = destinationCss.slice(menuRuleStart, destinationCss.indexOf("}", menuRuleStart));
+assert.match(menuRule, /max-height:min\(360px,calc\(100vh - 96px\)\)/, "下拉列表要限制高度，不能超出视口");
+assert.match(menuRule, /overflow-y:auto/, "超出高度时列表自身可滚动");
+assert.match(menuRule, /overscroll-behavior:contain/, "滚到底不能把弹窗一起带走");
 
 // 2. 默认：用户目录、DSH，路径来自后端配置，不写死。
 let tree = render();
@@ -172,4 +179,38 @@ const englishTree = englishPicker({ t: key => destinationLocales.en[key] || key,
 assert.ok(text(englishTree).includes("Unsafe directory: C:/unsafe"), "英文界面使用注入的错误翻译");
 assert.equal(text(englishTree).includes("目录不安全"), false);
 assert.equal(translatedDiagnostic, diagnostic, "保留完整诊断对象与参数");
+// 10. 一个项目根下登记了多个工作区：下拉必须逐条列出每个工作区名（对齐侧栏），
+//     而不是只留第一条，否则用户会以为只能选极少几个工作区。
+const monorepo = {
+  name: "DSH",
+  path: "D:\\DSH",
+  projectRoot: "D:\\DSH",
+  registeredPaths: ["D:\\DSH\\WorkZone\\github-proxy", "D:\\DSH\\WorkZone\\Powerpoint", "D:\\DSH\\WorkZone\\绘图区"],
+  available: true,
+  skillCount: 0,
+};
+const solo = { name: "solo", path: "D:\\solo", projectRoot: "D:\\solo", registeredPaths: ["D:\\solo"], available: true, skillCount: 0 };
+const brokenMulti = { name: "gone", path: "D:\\gone", registeredPaths: ["D:\\gone", "D:\\gone2"], available: false, skillCount: 0 };
+const choices = workspaceChoices([monorepo, solo, brokenMulti], t);
+assert.equal(choices.length, 6, "每个登记路径都要成为一条选项");
+const expectedValues = [
+  "D:\\DSH\\WorkZone\\github-proxy", "D:\\DSH\\WorkZone\\Powerpoint", "D:\\DSH\\WorkZone\\绘图区",
+  "D:\\solo", "D:\\gone", "D:\\gone2",
+].sort();
+assert.deepEqual(choices.map((c) => c.value).sort(), expectedValues, "选项覆盖全部登记路径");
+assert.equal(choices.some((c) => c.value === "D:\\DSH"), false, "未登记的规范项目根不能作为可写目标");
+assert.equal(choices.find((c) => c.value === "D:\\solo").label, "solo", "不重名时只显示工作区名");
+assert.equal(choices.find((c) => c.value === "D:\\gone").disabled, true, "目录不可用的工作区置灰");
+assert.equal(choices.find((c) => c.value === "D:\\gone2").disabled, true, "同一个失效项目根下的其他登记路径也置灰");
+const labels = workspaceChoices([monorepo, solo], t).map((c) => c.label);
+assert.deepEqual(labels, ["github-proxy", "Powerpoint", "solo", "绘图区"].sort((a, b) => a.localeCompare(b)), "长列表按名称排序，便于查找");
+assert.equal(destinationReady({ scope: "workspace", location: "dsh", workspace: "D:\\DSH\\WorkZone\\Powerpoint" }, [monorepo]), true, "非第一条登记路径也能提交");
+assert.equal(destinationReady({ scope: "workspace", location: "dsh", workspace: "D:\\DSH" }, [monorepo]), false, "未登记的项目根不能提交");
+selection = { scope: "workspace", location: "dsh", workspace: "D:\\DSH\\WorkZone\\Powerpoint" };
+tree = render({ workspaces: [monorepo, solo, brokenMulti] });
+const multiDropdown = byLabel(tree, t("dest.workspace"));
+assert.equal(multiDropdown.props.options.length, 7, "组件下拉包含占位项与全部登记路径");
+assert.deepEqual(multiDropdown.props.options.slice(1).map((o) => o.value).sort(), choices.map((c) => c.value).sort());
+assert.deepEqual(nodes(tree).filter((n) => n.type === "code").map((n) => n.children.join("")), ["D:\\DSH\\.dsh\\skills"], "多个工作区落在同一项目根时预览显示实际写入目录");
+assert.deepEqual(destinationPayload(selection), { workspace: "D:\\DSH\\WorkZone\\Powerpoint" }, "提交的仍是用户选中的登记路径，服务端再解析项目根");
 console.log("目标选择器：默认用户目录、工作区必须点选、联动位置、空列表与失效路径处理均通过");
